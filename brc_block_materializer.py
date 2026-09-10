@@ -17,6 +17,7 @@ Later stages add:
 from __future__ import annotations
 
 from collections import defaultdict
+import os
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -385,6 +386,248 @@ def reconstruct_blocks(
         host_bytes=(
             gathered_rows
             * ROW_BYTES
+        ),
+    )
+
+    return materialized, stats
+
+
+@dataclass(frozen=True)
+class ParentRMWStats:
+    """Accounting for parent read-modify-write materialization."""
+
+    num_blocks: int
+    gathered_rows: int
+    host_bytes: int
+    parent_read_bytes: int
+
+
+def parent_rmw_blocks(
+    layout: CheckpointLayout,
+    plans: Sequence[DirtyBlockPlan],
+    embedding_tables,
+    parent_fd: int,
+) -> tuple[
+    tuple[MaterializedBlock, ...],
+    ParentRMWStats,
+]:
+    """Materialize dirty blocks by parent read-modify-write.
+
+    For every dirty block:
+
+        1. read the complete 4 KiB parent block;
+        2. gather only the currently dirty embedding rows;
+        3. patch those rows into the parent block;
+        4. return one complete 4 KiB child block.
+
+    The function is batch-oriented with respect to embedding access.
+    Dirty rows from all RMW blocks are grouped by embedding table, so
+    each table is gathered with one index_select operation.
+
+    Embedding weights may reside on CPU or CUDA devices. The public
+    interface and checkpoint semantics are identical on both.
+    """
+
+    plans = _validate_plans(
+        layout,
+        plans,
+    )
+
+    weights = _validate_embedding_tables(
+        layout,
+        embedding_tables,
+    )
+
+    if not isinstance(parent_fd, int):
+        raise TypeError(
+            "parent_fd must be an integer file descriptor"
+        )
+
+    if not plans:
+        return (
+            (),
+            ParentRMWStats(
+                num_blocks=0,
+                gathered_rows=0,
+                host_bytes=0,
+                parent_read_bytes=0,
+            ),
+        )
+
+    # Read every complete parent block before patching.
+    #
+    # This intentionally uses normal buffered pread(). Later hybrid
+    # selection will decide whether using this path is worthwhile based
+    # on parent page-cache residency and dirty-row density.
+    block_buffers = {}
+
+    for plan in plans:
+        offset = (
+            plan.block_id
+            * BLOCK_SIZE
+        )
+
+        parent_data = os.pread(
+            parent_fd,
+            BLOCK_SIZE,
+            offset,
+        )
+
+        if len(parent_data) != BLOCK_SIZE:
+            raise RuntimeError(
+                "short parent checkpoint read for block {}: "
+                "{} != {}".format(
+                    plan.block_id,
+                    len(parent_data),
+                    BLOCK_SIZE,
+                )
+            )
+
+        block_buffers[
+            plan.block_id
+        ] = bytearray(
+            parent_data
+        )
+
+    # Gather only dirty rows, grouped across all RMW blocks by table.
+    #
+    # Each item:
+    #   (StorageRowRef, destination_block_id)
+    refs_by_table = defaultdict(list)
+
+    gathered_rows = 0
+
+    for plan in plans:
+        for ref in plan.dirty_rows:
+            refs_by_table[
+                ref.table_id
+            ].append(
+                (
+                    ref,
+                    plan.block_id,
+                )
+            )
+
+            gathered_rows += 1
+
+    for table_id in sorted(
+        refs_by_table
+    ):
+        items = refs_by_table[
+            table_id
+        ]
+
+        weight = weights[
+            table_id
+        ]
+
+        row_ids = torch.tensor(
+            [
+                ref.row_id
+                for ref, _block_id in items
+            ],
+            dtype=torch.long,
+            device=weight.device,
+        )
+
+        with torch.no_grad():
+            gathered = torch.index_select(
+                weight.detach(),
+                0,
+                row_ids,
+            )
+
+        # Same device boundary as reconstruction:
+        #
+        # CPU weights -> host contiguous tensor
+        # CUDA weights -> batched D2H transfer
+        gathered_host = (
+            gathered
+            .to(
+                device="cpu",
+                dtype=torch.float32,
+            )
+            .contiguous()
+        )
+
+        if gathered_host.shape != (
+            len(items),
+            EMBEDDING_DIM,
+        ):
+            raise RuntimeError(
+                "unexpected gathered embedding shape"
+            )
+
+        gathered_bytes = (
+            gathered_host
+            .numpy()
+            .tobytes(order="C")
+        )
+
+        expected_bytes = (
+            len(items)
+            * ROW_BYTES
+        )
+
+        if len(gathered_bytes) != expected_bytes:
+            raise RuntimeError(
+                "unexpected gathered embedding byte count"
+            )
+
+        for index, (
+            ref,
+            block_id,
+        ) in enumerate(items):
+            source_start = (
+                index
+                * ROW_BYTES
+            )
+            source_end = (
+                source_start
+                + ROW_BYTES
+            )
+
+            destination_start = (
+                ref.row_in_block
+                * ROW_BYTES
+            )
+            destination_end = (
+                destination_start
+                + ROW_BYTES
+            )
+
+            block_buffers[
+                block_id
+            ][
+                destination_start:
+                destination_end
+            ] = gathered_bytes[
+                source_start:
+                source_end
+            ]
+
+    materialized = tuple(
+        MaterializedBlock(
+            block_id=plan.block_id,
+            data=bytes(
+                block_buffers[
+                    plan.block_id
+                ]
+            ),
+        )
+        for plan in plans
+    )
+
+    stats = ParentRMWStats(
+        num_blocks=len(materialized),
+        gathered_rows=gathered_rows,
+        host_bytes=(
+            gathered_rows
+            * ROW_BYTES
+        ),
+        parent_read_bytes=(
+            len(materialized)
+            * BLOCK_SIZE
         ),
     )
 
