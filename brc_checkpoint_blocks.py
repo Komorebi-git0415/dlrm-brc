@@ -324,6 +324,91 @@ class CheckpointLayout:
     def table_sizes(self) -> np.ndarray:
         return self._table_sizes.copy()
 
+    def storage_slots_for_runtime_range(
+        self,
+        table_id: int,
+        row_start: int,
+        row_end: int,
+    ) -> np.ndarray:
+        """Return checkpoint storage slots for one runtime-row range.
+
+        The returned array is ordered by runtime row_id.  This provides
+        a vectorized bridge between runtime embedding-table order and
+        checkpoint storage order without constructing per-row Python
+        objects.
+
+        It is used by the scalable restore path.
+        """
+
+        for name, value in (
+            ("table_id", table_id),
+            ("row_start", row_start),
+            ("row_end", row_end),
+        ):
+            if (
+                isinstance(value, (bool, np.bool_))
+                or not isinstance(value, (int, np.integer))
+            ):
+                raise TypeError(
+                    f"{name} must be an integer"
+                )
+
+        table_id = int(table_id)
+        row_start = int(row_start)
+        row_end = int(row_end)
+
+        if (
+            table_id < 0
+            or table_id >= self.num_tables
+        ):
+            raise IndexError(
+                f"table_id out of range: {table_id}"
+            )
+
+        table_size = int(
+            self._table_sizes[table_id]
+        )
+
+        if (
+            row_start < 0
+            or row_end < row_start
+            or row_end > table_size
+        ):
+            raise IndexError(
+                "runtime row range out of bounds"
+            )
+
+        flat_start = (
+            int(self._table_offsets[table_id])
+            + row_start
+        )
+
+        flat_end = (
+            int(self._table_offsets[table_id])
+            + row_end
+        )
+
+        if self.mode == LAYOUT_LOCAL_ONLY:
+            return np.arange(
+                flat_start,
+                flat_end,
+                dtype=np.int64,
+            )
+
+        global_slot_by_flat_local = np.asarray(
+            self._global_layout[
+                "global_slot_by_flat_local"
+            ],
+            dtype=np.int64,
+        )
+
+        return (
+            global_slot_by_flat_local[
+                flat_start:flat_end
+            ]
+            .copy()
+        )
+
     def _validate_runtime_row(
         self,
         table_id: int,
@@ -522,6 +607,121 @@ class CheckpointLayout:
                 end_slot,
             )
         )
+
+
+def checkpoint_layout_fingerprint(
+    layout: CheckpointLayout,
+) -> str:
+    """Return a stable SHA-256 identity for checkpoint row placement.
+
+    For local-only layout, table boundaries uniquely determine storage
+    placement.
+
+    For global-mixed layout, the Stage-B
+    global_slot_by_flat_local permutation is also included.
+    """
+
+    import hashlib
+
+    if not isinstance(
+        layout,
+        CheckpointLayout,
+    ):
+        raise TypeError(
+            "layout must be a CheckpointLayout"
+        )
+
+    digest = hashlib.sha256()
+
+    digest.update(
+        b"brc-checkpoint-layout-v1\\0"
+    )
+
+    mode = layout.mode.encode(
+        "utf-8"
+    )
+
+    digest.update(
+        len(mode).to_bytes(
+            4,
+            "little",
+        )
+    )
+
+    digest.update(mode)
+
+    geometry = np.asarray(
+        [
+            BLOCK_SIZE,
+            EMBEDDING_DIM,
+            ROW_BYTES,
+            ROWS_PER_BLOCK,
+            layout.num_tables,
+            layout.total_rows,
+            layout.image_size,
+        ],
+        dtype="<u8",
+    )
+
+    digest.update(
+        geometry.tobytes()
+    )
+
+    table_sizes = np.asarray(
+        layout.table_sizes,
+        dtype="<u8",
+    )
+
+    digest.update(
+        len(table_sizes).to_bytes(
+            8,
+            "little",
+        )
+    )
+
+    digest.update(
+        table_sizes.tobytes()
+    )
+
+    if layout.mode == LAYOUT_GLOBAL_MIXED:
+        mapping = np.asarray(
+            layout._global_layout[
+                "global_slot_by_flat_local"
+            ],
+            dtype=np.int64,
+        )
+
+        if mapping.shape != (
+            layout.total_rows,
+        ):
+            raise RuntimeError(
+                "invalid global checkpoint mapping"
+            )
+
+        # Hash in bounded chunks rather than allocating one additional
+        # giant serialized mapping buffer.
+        hash_chunk_rows = 1_000_000
+
+        for start in range(
+            0,
+            layout.total_rows,
+            hash_chunk_rows,
+        ):
+            end = min(
+                start + hash_chunk_rows,
+                layout.total_rows,
+            )
+
+            chunk = np.asarray(
+                mapping[start:end],
+                dtype="<i8",
+            )
+
+            digest.update(
+                chunk.tobytes()
+            )
+
+    return digest.hexdigest()
 
 
 def _normalize_dirty_rows(

@@ -28,6 +28,7 @@ from brc_checkpoint_blocks import (
     ROW_BYTES,
     ROWS_PER_BLOCK,
     CheckpointLayout,
+    checkpoint_layout_fingerprint,
 )
 from brc_checkpoint_manager import CheckpointResult
 
@@ -36,7 +37,7 @@ SIDECAR_FORMAT = "brc-training-state"
 SIDECAR_VERSION = 1
 
 MANIFEST_FORMAT = "brc-checkpoint-manifest"
-MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2
 MANIFEST_FILENAME = "manifest.json"
 
 
@@ -392,6 +393,16 @@ class CheckpointPublisher:
                 "embedding_dim": EMBEDDING_DIM,
                 "row_bytes": ROW_BYTES,
                 "rows_per_block": ROWS_PER_BLOCK,
+                "table_sizes": [
+                    int(value)
+                    for value
+                    in self.layout.table_sizes
+                ],
+                "fingerprint": (
+                    checkpoint_layout_fingerprint(
+                        self.layout
+                    )
+                ),
             },
         }
 
