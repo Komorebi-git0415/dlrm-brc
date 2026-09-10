@@ -20,6 +20,7 @@ Kernel ABI baseline:
 from __future__ import annotations
 
 import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -217,6 +218,123 @@ class BRCCkptManager:
         self._session_fd = session_fd
         self._started = True
         self._generation = None
+
+    def resume(
+        self,
+        generation: int,
+        parent_path,
+    ) -> None:
+        """Resume an existing published BRC lineage.
+
+        ``generation`` and ``parent_path`` are application metadata.
+        Later stages obtain them from the published checkpoint manifest.
+        The kernel ledger restores the BRC session itself.
+        """
+
+        if self._started:
+            raise RuntimeError(
+                "BRC checkpoint manager is already started"
+            )
+
+        if (
+            not isinstance(generation, int)
+            or isinstance(generation, bool)
+            or generation < 0
+        ):
+            raise ValueError(
+                "generation must be a non-negative integer"
+            )
+
+        if not self.checkpoint_dir.is_dir():
+            raise FileNotFoundError(
+                "checkpoint directory does not exist: "
+                f"{self.checkpoint_dir}"
+            )
+
+        ledger_path = (
+            self.checkpoint_dir
+            / "lineage.ledger"
+        )
+
+        parent_path = Path(parent_path)
+
+        if not parent_path.is_absolute():
+            parent_path = (
+                self.checkpoint_dir
+                / parent_path
+            )
+
+        ledger_fd = os.open(
+            ledger_path,
+            os.O_RDWR,
+        )
+
+        parent_fd = None
+
+        try:
+            parent_fd = os.open(
+                parent_path,
+                os.O_RDONLY,
+            )
+
+            ledger_stat = os.fstat(
+                ledger_fd
+            )
+
+            parent_stat = os.fstat(
+                parent_fd
+            )
+
+            if not stat.S_ISREG(
+                parent_stat.st_mode
+            ):
+                raise ValueError(
+                    "resume parent must be a regular file"
+                )
+
+            if (
+                parent_stat.st_size
+                != self.layout.image_size
+            ):
+                raise ValueError(
+                    "resume parent size does not match "
+                    "checkpoint layout"
+                )
+
+            if (
+                parent_stat.st_dev
+                != ledger_stat.st_dev
+            ):
+                raise ValueError(
+                    "resume parent and lineage ledger must "
+                    "be on the same filesystem"
+                )
+
+            session_fd = (
+                brc_uapi.lineage_resume(
+                    ledger_fd
+                )
+            )
+
+        except Exception:
+            if parent_fd is not None:
+                os.close(
+                    parent_fd
+                )
+
+            os.close(
+                ledger_fd
+            )
+
+            raise
+
+        self._ledger_fd = ledger_fd
+        self._session_fd = session_fd
+        self._parent_fd = parent_fd
+        self._parent_path = parent_path
+        self._generation = generation
+        self._started = True
+        self._broken = False
 
     def create_root(
         self,
